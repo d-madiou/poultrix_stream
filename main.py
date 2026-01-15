@@ -21,6 +21,8 @@ import subprocess
 import shutil
 from pathlib import Path
 
+import shutil
+
 # ============================================
 # AWS IoT Configuration
 # ============================================
@@ -57,8 +59,14 @@ YOLO_INPUT_SIZE = 320
 # HLS CONFIGURATION
 # ============================================
 
-# FFmpeg path for Windows
-FFMPEG_PATH = r"C:\ffmpeg\bin\ffmpeg.exe"
+import shutil
+
+# Detect if running on Windows or Linux (Docker)
+if os.name == 'nt':
+    FFMPEG_PATH = r"C:\ffmpeg\bin\ffmpeg.exe"
+else:
+    # On Linux/Railway, we just use the command "ffmpeg" (installed via Dockerfile)
+    FFMPEG_PATH = shutil.which("ffmpeg") or "ffmpeg"
 
 HLS_OUTPUT_DIR = "hls_streams"
 os.makedirs(HLS_OUTPUT_DIR, exist_ok=True)
@@ -131,7 +139,8 @@ app.add_middleware(
 # SHARED STATE
 # ============================================
 
-ESP32_CAM_URL = "rtsp://poultrix:poultrix123@172.16.118.8:554/stream2"
+# Updated to use the public Ngrok tunnel
+ESP32_CAM_URL = "rtsp://poultrix:poultrix123@0.tcp.ap.ngrok.io:15178/stream2"
 
 class SharedState:
     def __init__(self):
