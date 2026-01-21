@@ -31,8 +31,8 @@ ENDPOINT = "a1s6wwnw9j50mk-ats.iot.ap-southeast-1.amazonaws.com"
 CCTV_TOPIC = 'poultry/cctv/detections'
 
 DEVICE_CONFIG = {
-    "device_id": "301",
-    "coop_id": 1,
+    "device_id": "202",
+    "coop_id": 3,
     "farm_id": 1,
     "device_name": "esp32_cam_1"
 }
@@ -140,7 +140,7 @@ app.add_middleware(
 # ============================================
 
 # Updated to use the public Ngrok tunnel - Can be updated dynamically via /update-camera-url
-ESP32_CAM_URL = os.environ.get("CAMERA_URL", "rtsp://poultrix:poultrix123@0.tcp.ap.ngrok.io:12557/stream2")
+ESP32_CAM_URL = "rtsp://poultrix:poultrix123@0.tcp.ap.ngrok.io:12874/stream2"  
 
 class SharedState:
     def __init__(self):
@@ -222,55 +222,100 @@ def setup_mqtt():
         print(f"❌ MQTT failed: {e}")
         return False
 
-def send_detection_to_aws(class_name, confidence, model_type='intruder', chicken_id=None, health_status=None):
-    """Send detection alert to AWS IoT"""
+def send_detection_to_aws(detections_list):
+    """
+    Send detection alert to AWS IoT in Lambda-compatible format
+    
+    Args:
+        detections_list: List of detection dictionaries, each containing:
+            - class_name: str
+            - confidence: float
+            - model_type: str ('intruder' or 'dead_alive')
+            - chicken_id: int or None
+            - health_status: str or None
+            - bbox: tuple (x1, y1, x2, y2)
+    """
     global last_detection_time, last_chicken_alert_time
     
     if not mqtt_connected:
         print("⚠️ AWS not connected, skipping alert")
         return
     
+    if not detections_list:
+        return
+    
     current_time = time.time()
     
-    if model_type == 'chicken_health':
-        cooldown_key = f"chicken_{chicken_id}"
-        cooldown_dict = last_chicken_alert_time
-        cooldown_period = CHICKEN_ALERT_COOLDOWN
-    else:
-        cooldown_key = class_name
-        cooldown_dict = last_detection_time
-        cooldown_period = DETECTION_COOLDOWN
+    # Apply cooldown logic
+    filtered_detections = []
     
-    if cooldown_key in cooldown_dict:
-        time_since_last = current_time - cooldown_dict[cooldown_key]
-        if time_since_last < cooldown_period:
-            with state.lock:
-                state.metrics['alerts_blocked_cooldown'] += 1
-            print(f"⏰ Cooldown active for {cooldown_key} ({time_since_last:.1f}s < {cooldown_period}s)")
-            return
+    for det in detections_list:
+        class_name = det['class_name']
+        confidence = det['confidence']
+        model_type = det['model_type']
+        chicken_id = det.get('chicken_id')
+        
+        # Determine cooldown key and period
+        if model_type == 'dead_alive':
+            cooldown_key = f"chicken_{chicken_id}"
+            cooldown_dict = last_chicken_alert_time
+            cooldown_period = CHICKEN_ALERT_COOLDOWN
+        else:
+            cooldown_key = class_name
+            cooldown_dict = last_detection_time
+            cooldown_period = DETECTION_COOLDOWN
+        
+        # Check cooldown
+        if cooldown_key in cooldown_dict:
+            time_since_last = current_time - cooldown_dict[cooldown_key]
+            if time_since_last < cooldown_period:
+                with state.lock:
+                    state.metrics['alerts_blocked_cooldown'] += 1
+                print(f"⏰ Cooldown active for {cooldown_key} ({time_since_last:.1f}s < {cooldown_period}s)")
+                continue
+        
+        # Update cooldown timestamp
+        cooldown_dict[cooldown_key] = current_time
+        
+        # Convert bbox from (x1, y1, x2, y2) to [x, y, width, height]
+        x1, y1, x2, y2 = det['bbox']
+        bbox_formatted = [x1, y1, x2 - x1, y2 - y1]
+        
+        # Build detection object matching Lambda format
+        detection_obj = {
+            'class': class_name,
+            'confidence': round(confidence, 4),
+            'model_type': model_type,
+            'chicken_id': chicken_id,
+            'health_status': det.get('health_status'),
+            'bbox': bbox_formatted
+        }
+        
+        filtered_detections.append(detection_obj)
     
-    cooldown_dict[cooldown_key] = current_time
+    if not filtered_detections:
+        return
     
+    # Build payload in Lambda-compatible format
     payload = {
-        **DEVICE_CONFIG,
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-        "detection_type": model_type,
-        "class": class_name,
-        "confidence": round(confidence, 2)
+        'farm_id': DEVICE_CONFIG['farm_id'],
+        'coop_id': DEVICE_CONFIG['coop_id'],
+        'device_id': DEVICE_CONFIG['device_id'],
+        'timestamp': datetime.utcnow().isoformat() + 'Z',
+        'detections': filtered_detections
     }
-    
-    if model_type == 'chicken_health':
-        payload['chicken_id'] = chicken_id
-        payload['health_status'] = health_status
     
     try:
         result = mqtt_client.publish(CCTV_TOPIC, json.dumps(payload), qos=1)
         
         if result.rc == mqtt.MQTT_ERR_SUCCESS:
             with state.lock:
-                state.metrics['alerts_sent'] += 1
+                state.metrics['alerts_sent'] += len(filtered_detections)
                 state.metrics['last_detection_time'] = datetime.now().isoformat()
-            print(f"✅ Alert sent: {class_name} ({confidence:.2f})")
+            
+            print(f"✅ Alert sent with {len(filtered_detections)} detection(s):")
+            for det in filtered_detections:
+                print(f"   - {det['class']} ({det['confidence']:.2%})")
         else:
             print(f"❌ Publish failed: {result.rc}")
     except Exception as e:
@@ -399,7 +444,8 @@ def thread_gpu_inference():
             scale_x = orig_w / YOLO_INPUT_SIZE
             scale_y = orig_h / YOLO_INPUT_SIZE
             
-            detections = []
+            detections = []  # For UI
+            alerts_to_send = []  # For AWS
             detection_found = False
             bird_detected = False
             bird_boxes = []
@@ -448,11 +494,16 @@ def thread_gpu_inference():
                             'model': 'intruder'
                         })
                         
+                        # Queue intruder alerts
                         if class_name in INTRUDER_CLASSES and confidence > CONFIDENCE_THRESHOLD:
-                            try:
-                                alert_queue.put_nowait((class_name, confidence, 'intruder', None, None))
-                            except:
-                                pass
+                            alerts_to_send.append({
+                                'class_name': class_name,
+                                'confidence': confidence,
+                                'model_type': 'intruder',
+                                'chicken_id': None,
+                                'health_status': None,
+                                'bbox': (x1, y1, x2, y2)
+                            })
             
             # Chicken health cascade logic
             if bird_detected and model_chicken_detector:
@@ -551,24 +602,30 @@ def thread_gpu_inference():
                                     
                                     detections.append({
                                         'bbox': bird_info['bbox'],
-                                        'class': f'chicken_{status}',
+                                        'class': f'chicken_{status}',  # Will be "chicken_dead" or "chicken_alive"
                                         'confidence': conf,
                                         'model': 'dead_alive',
                                         'health': health_status
                                     })
                                     
+                                    # Queue chicken health alerts
                                     if conf > CONFIDENCE_THRESHOLD:
-                                        try:
-                                            alert_queue.put_nowait((
-                                                status,
-                                                conf,
-                                                'chicken_health',
-                                                chicken_id_counter,
-                                                health_status
-                                            ))
-                                        except:
-                                            pass
+                                        alerts_to_send.append({
+                                            'class_name': status,
+                                            'confidence': conf,
+                                            'model_type': 'dead_alive',
+                                            'chicken_id': chicken_id_counter,
+                                            'health_status': health_status,
+                                            'bbox': bird_info['bbox']
+                                        })
                                     break
+            
+            # Send all alerts in batch
+            if alerts_to_send:
+                try:
+                    alert_queue.put_nowait(alerts_to_send)
+                except:
+                    pass
             
             with state.lock:
                 state.detection_results = detections
@@ -603,24 +660,23 @@ def thread_send_alerts():
     
     while True:
         try:
-            alert_data = alert_queue.get(timeout=1.0)
+            # Get batched alerts from queue (timeout prevents blocking forever)
+            alerts_batch = alert_queue.get(timeout=1.0)
             
-            if len(alert_data) == 5:
-                class_name, confidence, model_type, chicken_id, health_status = alert_data
-            else:
-                class_name, confidence = alert_data[:2]
-                model_type = 'intruder'
-                chicken_id = None
-                health_status = None
-            
+            # Skip if MQTT not connected
             if not mqtt_connected:
+                print("⚠️ MQTT not connected, discarding alerts")
                 continue
             
-            send_detection_to_aws(class_name, confidence, model_type, chicken_id, health_status)
+            # alerts_batch is a list of detection dictionaries
+            if isinstance(alerts_batch, list) and len(alerts_batch) > 0:
+                send_detection_to_aws(alerts_batch)
+            else:
+                print("⚠️ Received empty or invalid alerts batch")
             
         except:
-            pass
-
+            # Queue timeout is normal, just continue silently
+            time.sleep(0.1)
 # ============================================
 # THREAD 4 & 5: Streaming Functions (MJPEG)
 # ============================================
